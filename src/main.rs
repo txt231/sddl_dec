@@ -1,136 +1,176 @@
 mod include;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write, Cursor};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use clap::Parser;
 use binrw::{BinReaderExt};
-use crate::include::{read_exact, decrypt, decipher, decompress_zlib, SddlSecHeader, EntryHeader, ModuleHeader, ContentHeader};
+use crate::include::{read_exact, decrypt, decipher, decompress_zlib, DOWNLOAD_ID, TDI_FILENAME, SUPPORTED_TDI_VERSION, INFO_FILE_EXTENSION,
+                    SecHeader, FileHeader, ModuleComHeader, ModuleHeader, ContentHeader, TdiHead, TdiGroupHead, TdiTgtInf};
 
 /// Tool for decrypting and unpacking Panasonic TV SDDL.SEC update files. 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Show debug information about extraction process.
-    #[arg(short = 'd')]
-    debug: bool,
+    /// Print more detailed information about the file
+    #[arg(short = 'v')]
+    verbose: bool,
 
-    /// Keep .TXT files
-    #[arg(short = 'k')]
-    keep_txt: bool,
+    /// Save .TXT and TDI files
+    #[arg(short = 's')]
+    save_extra: bool,
 
     input_file: String,
-    output_folder: String,
+    output_folder: Option<String>,
+}
+
+fn get_sec_file(mut file: &File) -> Result<(FileHeader, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut hdr_reader = Cursor::new(decrypt(&read_exact(&mut file, 32)?)?);
+    let file_header: FileHeader = hdr_reader.read_be()?;
+    let file_data = decrypt(&read_exact(&mut file, file_header.size() as usize)?)?;
+
+    Ok((file_header, file_data))
+}
+
+fn parse_tdi_to_modules(tdi_data: Vec<u8>, verbose: bool) -> Result<Vec<TdiTgtInf>, Box<dyn std::error::Error>> {
+    let mut tdi_reader = Cursor::new(tdi_data);
+    let tdi_header: TdiHead = tdi_reader.read_be()?;
+    if tdi_header.download_id != DOWNLOAD_ID {
+        return Err("Invalid TDI header!".into());
+    }
+    if tdi_header.format_version != SUPPORTED_TDI_VERSION {
+        return Err(format!("Unsupported TDI format version {}! (The supported version is {})", tdi_header.format_version, SUPPORTED_TDI_VERSION).into());
+    }
+
+    println!("[TDI] Group count: {}", tdi_header.num_of_group);
+    let mut modules: Vec<TdiTgtInf> = Vec::new();
+
+    for _i in 0..tdi_header.num_of_group {
+        let group_head: TdiGroupHead = tdi_reader.read_be()?;
+        println!("[TDI] Group ID: {}, Target count: {}", group_head.group_id, group_head.num_of_target);
+
+        for _i in 0..group_head.num_of_target {
+            let tgt_inf: TdiTgtInf = tdi_reader.read_be()?;
+            println!("[TDI] - {}, Target ID: {}, Segment count: {}, Version: {}",
+                    tgt_inf.module_name(), tgt_inf.target_id, tgt_inf.num_of_txx, tgt_inf.version_string());
+
+            if verbose {println!("{:?}", tgt_inf)};
+
+            //push unique modules
+            if !modules.iter().any(|m| m.module_name() == tgt_inf.module_name()) {
+                modules.push(tgt_inf);
+            }
+        }
+    }
+
+    Ok(modules)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("sddl_dec Tool Version 5.0");
+    println!("sddl_dec Tool Version 6.0");
     let args = Args::parse();
 
-    let file_path = args.input_file;
-    println!("Input file: {}", file_path);
+    let input_file = args.input_file;
+    let file_path = PathBuf::from(&input_file);
+    println!("Input file: {}", input_file);
 
-    let output_folder = args.output_folder;
+    let output_folder = if args.output_folder.is_some() {
+        args.output_folder.unwrap()
+    } else {
+        format!("_{}", file_path.file_name().and_then(|s| s.to_str()).unwrap())
+    };
     println!("Output folder: {}\n", output_folder);
 
-    let debug = args.debug;
-    let keep_txt = args.keep_txt;
-
+    let save_extra = args.save_extra;
+    let verbose = args.verbose;
     let mut file = File::open(file_path)?;
 
-    let mut hdr_reader = Cursor::new(decipher(&read_exact(&mut file, 32)?));
-    let hdr: SddlSecHeader = hdr_reader.read_be()?;
-    if debug {println!("{:?}", hdr)};
+    let mut secfile_hdr_reader = Cursor::new(decipher(&read_exact(&mut file, 32)?));
+    let secfile_header: SecHeader = secfile_hdr_reader.read_be()?;
+    if secfile_header.download_id != DOWNLOAD_ID {
+        return Err("Invalid secfile header!".into());
+    }
+    println!("File info -\nKey ID: {}\nGroup count: {}\nModule file count: {}\n", secfile_header.key_id(), secfile_header.grp_num(), secfile_header.prg_num());
+    fs::create_dir_all(&output_folder)?;
 
-    if !hdr.is_magic_valid() {
-        println!("This is not a valid SDDL.SEC file, aborting!");
-        return Ok(())
-    } else {
-        println!("Valid SDDL.SEC detected");
+    let (tdi_file, tdi_data) = get_sec_file(&file)?;
+    println!("[TDI] Name: {}, Size: {}", tdi_file.name(), tdi_file.size());
+    if save_extra { //Save SDIT
+        let mut out_file = OpenOptions::new().write(true).create(true).open(Path::new(&output_folder).join(tdi_file.name()))?;
+        out_file.write_all(&tdi_data)?;
+    }
+    if tdi_file.name() != TDI_FILENAME {
+        return Err(format!("Invalid TDI filename {}!, expected: {}", tdi_file.name(), TDI_FILENAME).into());
+    }
+    //parse TDI
+    let modules = parse_tdi_to_modules(tdi_data, verbose)?;
+
+    //get info files, each info file belongs to its respecitve group in the TDI
+    for i in 0..secfile_header.grp_num() {
+        let (info_file, info_data) = get_sec_file(&file)?;
+        println!("\n[INFO] ID: {}, Name: {}, Size: {}", i, info_file.name(), info_file.size());
+        if !info_file.name().ends_with(INFO_FILE_EXTENSION) {
+            return Err(format!("Info file {} does not have the expected extension {}!", info_file.name(), INFO_FILE_EXTENSION).into());
+        }
+        if save_extra { //Save info file
+            let mut out_file = OpenOptions::new().write(true).create(true).open(Path::new(&output_folder).join(info_file.name()))?;
+            out_file.write_all(&info_data)?;
+        }
+        //print info file
+        println!("{}", String::from_utf8_lossy(&info_data));
     }
 
-    //SDIT.FDI + info files + module files
-    let total_entry_count = 1 + hdr.info_entry_count() + hdr.module_entries_count();
-    println!("File info:\nInfo entry count: {}\nModule entry count: {}\nTotal entry count: {}",
-            hdr.info_entry_count(), hdr.module_entries_count(), total_entry_count);
+    //parse module data
+    for (i, module) in modules.iter().enumerate(){
+        println!("\nModule #{}/{} - {}, Target ID: {}, Segment count: {}, Version: {}", 
+                i+1, &modules.len(), module.module_name(), module.target_id, module.num_of_txx, module.version_string());
 
-    for i in 0..total_entry_count {
-        let mut entry_header_reader = Cursor::new(decrypt(&read_exact(&mut file, 32)?)?);
-        let entry_header: EntryHeader = entry_header_reader.read_be()?;
-        if debug {println!("{:?}", entry_header)};
+        for i in 0..module.num_of_txx {
+            let (module_file, module_data) = get_sec_file(&file)?;
+            if !module_file.name().starts_with(&module.module_name()) {
+                return Err(format!("Module file {} does not start with the module's name: {}!", module_file.name(), module.module_name()).into());
+            }    
+            println!("  Segment #{}/{} - Name: {}, Size: {}", i+1, module.num_of_txx, module_file.name(), module_file.size());
 
-        println!("\n({}/{}) File: {}, Size: {}", i + 1, total_entry_count, entry_header.name(), entry_header.size());
-
-        let data = read_exact(&mut file, entry_header.size() as usize)?;
-        let dec_data = decrypt(&data)?;
-
-        fs::create_dir_all(&output_folder)?;
-        //detect the file type based on the counts of each file
-        if i == 0 { //SDIT.FDI file
-            if debug {println!("SDIT.FDI file")};
-            let output_path = Path::new(&output_folder).join(entry_header.name());
-            let mut out_file = OpenOptions::new().write(true).create(true).open(output_path)?;
-            out_file.write_all(&dec_data)?;
-            println!("-- Saved file!");
-
-        } else if i - 1 < hdr.info_entry_count() { //.TXT info file
-            if debug {println!(".TXT info file")};
-            if !keep_txt {
-                println!("{}", String::from_utf8_lossy(&dec_data));
-                continue
-            } else {
-                let output_path = Path::new(&output_folder).join(entry_header.name());
-                let mut out_file = OpenOptions::new().write(true).create(true).open(output_path)?;
-                out_file.write_all(&dec_data)?;
-                println!("-- Saved file!");
+            let mut module_reader = Cursor::new(module_data);
+            let com_header: ModuleComHeader = module_reader.read_be()?;
+            if verbose {println!("{:?}", com_header)};
+            if com_header.download_id != DOWNLOAD_ID {
+                return Err("Invalid module com_header!".into());
             }
 
-        } else { //Module file
-            if debug {println!("Module file")};
-            let name = entry_header.name();
-            let source_name = name.split(".").next().unwrap();
-            if debug{println!("Source name: {}", source_name)};
-
-            let mut module_reader = Cursor::new(dec_data);
             let module_header: ModuleHeader = module_reader.read_be()?;
-            if debug {println!("{:?}", module_header)};
-            println!("- Version: {}.{}{}{}", module_header.file_version[0], module_header.file_version[1], module_header.file_version[2], module_header.file_version[3]);
-
-            let module_data = read_exact(&mut module_reader, module_header.compressed_data_size as usize)?;
-            println!("- Deciphering...");
-            let deciphered_data = decipher(&module_data);
-
-            let content: Vec<u8>;
+            if verbose {println!("{:?}", module_header)};
+            let mut module_data = read_exact(&mut module_reader, module_header.cmp_size as usize)?;
+            if module_header.is_ciphered() {
+                println!("      - Deciphering...");
+                module_data = decipher(&module_data);
+            }
             if module_header.is_compressed() {
-                println!("-- Decompressing...");
-                content = decompress_zlib(&deciphered_data)?;
-            } else {
-                println!("-- Uncompressed...");
-                content = deciphered_data;
+                println!("      - Decompressing...");
+                module_data = decompress_zlib(&module_data)?;
             }
 
-            let mut content_reader = Cursor::new(content);
+            let mut content_reader = Cursor::new(module_data);
             let content_header: ContentHeader = content_reader.read_be()?;
-            if debug {println!("{:?}\nDest offset: {}\nSource offset: {}", content_header, content_header.dest_offset(), content_header.source_offset())};
+            println!("      --> 0x{:X} @ 0x{:X}", content_header.size, content_header.dest_offset());
+            
+            let output_path: PathBuf;
+            if content_header.has_subfile() {
+                let sub_filename_bytes = read_exact(&mut content_reader, 0x100)?;
+                let sub_filename = include::string_from_bytes(&sub_filename_bytes);
+                println!("      --> {}", sub_filename);
 
-            let output_path: PathBuf; 
-            if content_header.source_offset() == 270 {
-                if debug{println!("2014-2018 detected!")}
-                let file_name_bytes = read_exact(&mut content_reader, 256)?;
-                let file_name = include::string_from_bytes(&file_name_bytes);
-                println!("--- File name: {}", file_name);
+                let sub_folder_path = Path::new(&output_folder).join(module.module_name());
+                fs::create_dir_all(&sub_folder_path)?;
+                output_path = Path::new(&sub_folder_path).join(sub_filename);
 
-                let out_folder_path = Path::new(&output_folder).join(source_name);
-                fs::create_dir_all(&out_folder_path)?;
-                output_path = Path::new(&out_folder_path).join(file_name);
             } else {
-                output_path = Path::new(&output_folder).join(format!("{}.bin", source_name));
+                output_path = Path::new(&output_folder).join(format!("{}.bin", module.module_name()));
             }
 
             let data = read_exact(&mut content_reader, content_header.size as usize)?;
-
             let mut out_file = OpenOptions::new().read(true).write(true).create(true).open(output_path)?;
             out_file.seek(SeekFrom::Start(content_header.dest_offset() as u64))?;
             out_file.write_all(&data)?;
-            println!("--- Saved!");
 
         }
     }
