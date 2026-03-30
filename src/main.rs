@@ -1,4 +1,5 @@
 mod include;
+mod sdboot;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -17,6 +18,9 @@ struct Args {
     /// Save .TXT and TDI files
     #[arg(short = 's')]
     save_extra: bool,
+
+    #[arg(short = 'd')]
+    sdboot: bool,
 
     input_file: String,
     output_folder: Option<String>,
@@ -64,6 +68,52 @@ fn parse_tdi_to_modules(tdi_data: Vec<u8>, verbose: bool) -> Result<Vec<TdiTgtIn
     Ok(modules)
 }
 
+fn dump_sdboot(file_path: PathBuf, output_folder: &String) -> Result<(), Box<dyn std::error::Error>> {
+
+    let mut file = File::open(file_path)?;
+
+
+    let mut secfile_hdr_reader = Cursor::new(sdboot::decipher(&read_exact(&mut file, sdboot::SdbootSecHeader::SIZE)?));
+    
+    let secfile_header: sdboot::SdbootSecHeader = secfile_hdr_reader.read_be()?;
+
+    let key_id = secfile_header.key_id();
+    if key_id != 0 && key_id != 1 {
+        return Err(format!("Invalid sdboot sec key id! got {} but must be 0 or 1", key_id).into());
+    }
+
+    println!("File info -\nKey ID: {}\nFile count: {}\n", secfile_header.key_id(), secfile_header.num_files());
+
+    fs::create_dir_all(output_folder)?;
+
+    for i in 0..secfile_header.num_files() {
+        
+        let mut entry_header_reader = Cursor::new(sdboot::decrypt(key_id, &read_exact(&mut file, sdboot::SdbootEntryHeader::SIZE)?)?);
+        let entry_header: sdboot::SdbootEntryHeader = entry_header_reader.read_be()?;
+
+        let entry_name = entry_header.name()?;
+        let entry_size= entry_header.file_size();
+
+        println!("File: {} Size: {:#x}", entry_name, entry_size);
+
+        let file_data=sdboot::decrypt(key_id, &read_exact(&mut file, entry_size)?)?;
+        
+        // this has a 0x20 byte header. seems to contain some number as string again. not sure if
+        // its useful
+        let actual_file_data = &file_data[0x20..];
+
+        let output_path = Path::new(&output_folder).join(entry_name);
+
+
+        let mut out_file = OpenOptions::new().read(true).write(true).create(true).open(output_path)?;
+        out_file.write_all(actual_file_data)?;
+
+    }
+
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("sddl_dec Tool Version 6.0");
     let args = Args::parse();
@@ -78,6 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("_{}", file_path.file_name().and_then(|s| s.to_str()).unwrap())
     };
     println!("Output folder: {}\n", output_folder);
+
+    if args.sdboot {
+        return dump_sdboot(file_path, &output_folder);
+    }
+
 
     let save_extra = args.save_extra;
     let verbose = args.verbose;
